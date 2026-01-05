@@ -181,6 +181,90 @@ ws.send(JSON.stringify({ prompt: "Add dark mode" }));
 
 ---
 
+## Authentication Options
+
+Securing preview and relay server access requires authentication at multiple layers.
+
+### Option A: Daytona Private Sandboxes (Built-in)
+
+Use `public: false` and pass tokens with requests:
+
+```typescript
+// Create private sandbox
+const sandbox = await daytona.create({
+  snapshot: CLAUDE_SNAPSHOT_NAME,
+  public: false,  // Requires token for access
+});
+
+// SDK returns URL + token
+const preview = await sandbox.getPreviewLink(3000);
+// { url: "https://3000-...", token: "vg5c0ylmcimr8b..." }
+```
+
+**Access requires header**: `x-daytona-preview-token: <token>`
+
+**Limitation**: Browser WebSocket API doesn't support custom headers. Workarounds:
+- Pass token as query parameter: `wss://...?token=xxx`
+- Use WebSocket subprotocol: `new WebSocket(url, [token])`
+
+### Option B: Application-Level Auth (Relay Server)
+
+Add token validation in the relay server:
+
+```typescript
+// relay-server.ts
+wss.on("connection", (ws, req) => {
+  const url = new URL(req.url, 'http://localhost');
+  const token = url.searchParams.get('token');
+
+  if (!isValidToken(token)) {
+    ws.close(4001, 'Unauthorized');
+    return;
+  }
+  // ... handle connection
+});
+```
+
+**Flow**: Worker issues session tokens → Browser passes token to relay → Relay validates
+
+### Option C: Customer Proxy (Recommended for Production)
+
+Daytona's **Customer Proxy** provides enterprise-grade authentication by routing all preview traffic through your own infrastructure:
+
+```
+┌─────────┐      HTTPS       ┌──────────────────┐      Internal      ┌─────────────────┐
+│ Browser │ ───────────────► │  Customer Proxy  │ ─────────────────► │ Daytona Sandbox │
+│         │                  │  (your domain)   │                    │                 │
+└─────────┘                  └──────────────────┘                    └─────────────────┘
+                                     │
+                              ┌──────┴──────┐
+                              │ Your Auth   │
+                              │ (SSO/OAuth) │
+                              └─────────────┘
+```
+
+**Benefits**:
+- Custom domain (e.g., `preview.yourcompany.com`)
+- Integrate with existing auth (SSO, OAuth, SAML)
+- No Daytona URLs exposed to end users
+- Custom error pages and branding
+- Full control over access policies
+
+**Reference**: [Customer Proxy Documentation](https://www.daytona.io/dotfiles/sandbox-preview-urls-and-auth-customer-proxy)
+
+### Comparison
+
+| Approach | Complexity | Auth Integration | Custom Domain | Production Ready |
+|----------|------------|------------------|---------------|------------------|
+| Public sandbox | None | ❌ | ❌ | ❌ |
+| Private + tokens | Low | Limited | ❌ | ⚠️ |
+| App-level auth | Medium | Custom | ❌ | ⚠️ |
+| **Customer Proxy** | Higher | Full (SSO/OAuth) | ✅ | ✅ |
+
+**Recommendation**: Use **Customer Proxy** for production deployments requiring user authentication, custom domains, and enterprise security compliance.
+
+---
+
 ## Open Source Implementations
 
 | Project | Streaming Method | Key Feature |
@@ -201,6 +285,7 @@ ws.send(JSON.stringify({ prompt: "Add dark mode" }));
 - [Process & Code Execution](https://www.daytona.io/docs/en/process-code-execution/)
 - [PTY (Pseudo Terminal)](https://www.daytona.io/docs/en/pty/)
 - [Preview & Authentication](https://www.daytona.io/docs/en/preview-and-authentication/) - Multi-port exposure
+- [Customer Proxy](https://www.daytona.io/dotfiles/sandbox-preview-urls-and-auth-customer-proxy) - Enterprise auth & custom domains
 
 ### Claude Code / Agent SDK
 - [Agent SDK Overview](https://docs.anthropic.com/en/docs/claude-code/sdk)
