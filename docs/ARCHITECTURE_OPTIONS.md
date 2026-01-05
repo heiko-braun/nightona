@@ -69,14 +69,26 @@ The Claude Agent SDK requires filesystem access to read/write code, so it **must
 
 #### Architecture
 
+Daytona sandboxes can expose **multiple ports** (range 3000-9999) with public preview URLs. This enables serving both the app preview and WebSocket relay from the same sandbox:
+
 ```
-┌─────────┐      WebSocket       ┌─────────────────┐     SDK AsyncIterator     ┌─────────────┐
-│ Browser │ ◄──────────────────► │ Streaming Relay │ ◄───────────────────────► │ Claude SDK  │
-│ (React) │                      │ (in Sandbox)    │                           │ query()     │
-└─────────┘                      └─────────────────┘                           └─────────────┘
-                                         │
-                                    Daytona Sandbox
-                                   (public preview URL)
+                                      Daytona Sandbox (public: true)
+                                 ┌─────────────────────────────────────┐
+                                 │                                     │
+┌─────────────┐   WebSocket      │  ┌─────────────────┐    AsyncIter   │   ┌─────────────┐
+│   Browser   │◄────────────────────│ Streaming Relay │◄──────────────────►│ Claude SDK  │
+│   (React)   │   :8080          │  │ (relay-server)  │                │   │  query()    │
+│             │                  │  └─────────────────┘                │   └─────────────┘
+│  ┌───────┐  │   HTTP (iframe)  │  ┌─────────────────┐                │
+│  │Preview│◄───────────────────────│  Vite Dev Server │                │
+│  │ iframe│  │   :3000          │  │  (user's app)   │                │
+│  └───────┘  │                  │  └─────────────────┘                │
+└─────────────┘                  │                                     │
+                                 └─────────────────────────────────────┘
+
+Preview URLs:
+  - https://3000-{sandbox-id}.{runner}.daytona.work  → Vite dev server
+  - https://8080-{sandbox-id}.{runner}.daytona.work  → WebSocket relay
 ```
 
 #### Implementation
@@ -116,10 +128,37 @@ ws.onmessage = (event) => {
 ws.send(JSON.stringify({ prompt: "Add a dark mode toggle" }));
 ```
 
-**3. Cloudflare Worker role:**
-- Initialize sandbox and start relay server
-- Return relay server's public URL to browser
-- Browser connects directly (bypasses Worker for streaming)
+**3. Cloudflare Worker initialization (`/api/initialize`):**
+
+```typescript
+// Start both services with PM2
+await sandbox.process.executeCommand('pm2 start ecosystem.config.cjs');  // vite on :3000
+await sandbox.process.executeCommand('pm2 start relay-server.js');       // relay on :8080
+
+// Get public URLs for both ports
+const devServerUrl = await sandbox.getPreviewLink(3000);
+const relayUrl = await sandbox.getPreviewLink(8080);
+
+return Response.json({
+  success: true,
+  devServerUrl: devServerUrl.url,   // For iframe preview
+  relayUrl: relayUrl.url            // For WebSocket connection
+});
+```
+
+**4. Browser connects to both services:**
+
+```typescript
+// Display live preview in iframe
+<iframe src={devServerUrl} />
+
+// Stream Claude activity via WebSocket
+const ws = new WebSocket(relayUrl.replace('https://', 'wss://'));
+ws.onmessage = (event) => renderMessage(JSON.parse(event.data));
+ws.send(JSON.stringify({ prompt: "Add dark mode" }));
+```
+
+**Key benefit**: Browser connects directly to sandbox—no Cloudflare Worker in the streaming path.
 
 #### Comparison
 
@@ -161,6 +200,7 @@ ws.send(JSON.stringify({ prompt: "Add a dark mode toggle" }));
 - [TypeScript SDK](https://www.daytona.io/docs/en/typescript-sdk/)
 - [Process & Code Execution](https://www.daytona.io/docs/en/process-code-execution/)
 - [PTY (Pseudo Terminal)](https://www.daytona.io/docs/en/pty/)
+- [Preview & Authentication](https://www.daytona.io/docs/en/preview-and-authentication/) - Multi-port exposure
 
 ### Claude Code / Agent SDK
 - [Agent SDK Overview](https://docs.anthropic.com/en/docs/claude-code/sdk)
@@ -175,7 +215,8 @@ ws.send(JSON.stringify({ prompt: "Add a dark mode toggle" }));
 
 ## Recommended Next Steps
 
-1. Implement WebSocket support via Durable Objects
-2. Replace `executeCommand()` with `createPty()` for streaming
-3. Add SSE/WebSocket endpoint to stream `onData` events to frontend
-4. Update React UI to render incremental output
+1. Create relay server script using Claude Agent SDK with WebSocket
+2. Update Docker snapshot to include `@anthropic-ai/claude-agent-sdk` and `ws` packages
+3. Modify `/api/initialize` to start relay server and return both URLs
+4. Update React UI to connect WebSocket to relay URL and render streaming messages
+5. Add PM2 ecosystem config for relay server lifecycle management
