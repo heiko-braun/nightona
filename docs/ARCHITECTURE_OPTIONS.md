@@ -53,9 +53,92 @@ for await (const message of query({ prompt })) {
 
 **Reference**: [Claude Agent SDK - TypeScript](https://github.com/anthropics/claude-agent-sdk-typescript)
 
-### Option 3: Hybrid Approach
+### Option 3: Hybrid Approach (Recommended)
 
-Run the Agent SDK inside Daytona sandbox, stream via PTY or custom WebSocket bridge.
+Run the Agent SDK inside the Daytona sandbox with a WebSocket relay server, enabling structured message streaming directly to the browser.
+
+#### Why Hybrid?
+
+| Component | Can Run SDK? | Reason |
+|-----------|--------------|--------|
+| Cloudflare Worker | ❌ | No filesystem, no persistent process |
+| Browser | ❌ | No filesystem access, security constraints |
+| Daytona Sandbox | ✅ | Full Node.js environment with filesystem |
+
+The Claude Agent SDK requires filesystem access to read/write code, so it **must** run inside the sandbox.
+
+#### Architecture
+
+```
+┌─────────┐      WebSocket       ┌─────────────────┐     SDK AsyncIterator     ┌─────────────┐
+│ Browser │ ◄──────────────────► │ Streaming Relay │ ◄───────────────────────► │ Claude SDK  │
+│ (React) │                      │ (in Sandbox)    │                           │ query()     │
+└─────────┘                      └─────────────────┘                           └─────────────┘
+                                         │
+                                    Daytona Sandbox
+                                   (public preview URL)
+```
+
+#### Implementation
+
+**1. Streaming relay server inside sandbox:**
+
+```typescript
+// /tmp/project/relay-server.ts
+import { query } from "@anthropic-ai/claude-agent-sdk";
+import { WebSocketServer } from "ws";
+
+const wss = new WebSocketServer({ port: 8080 });
+
+wss.on("connection", (ws) => {
+  ws.on("message", async (data) => {
+    const { prompt } = JSON.parse(data);
+
+    for await (const message of query({ prompt, options: { cwd: "/tmp/project" } })) {
+      ws.send(JSON.stringify(message));
+    }
+  });
+});
+```
+
+**2. Browser connects directly to sandbox:**
+
+```typescript
+// Daytona provides public preview URLs
+const ws = new WebSocket("wss://sandbox-abc123.daytona.io:8080");
+
+ws.onmessage = (event) => {
+  const message = JSON.parse(event.data);
+  // message.type: 'assistant' | 'user' | 'result' | 'system'
+  renderIncrementally(message);
+};
+
+ws.send(JSON.stringify({ prompt: "Add a dark mode toggle" }));
+```
+
+**3. Cloudflare Worker role:**
+- Initialize sandbox and start relay server
+- Return relay server's public URL to browser
+- Browser connects directly (bypasses Worker for streaming)
+
+#### Comparison
+
+| Approach | Output Format | Streaming | Structured Events |
+|----------|---------------|-----------|-------------------|
+| Current (CLI + executeCommand) | Raw JSON | ❌ | ❌ |
+| Option 1 (PTY) | Raw terminal text | ✅ | ❌ |
+| **Option 3 (Hybrid)** | SDKMessage objects | ✅ | ✅ |
+
+#### Trade-offs
+
+| Pros | Cons |
+|------|------|
+| Rich, typed message stream | More complex setup |
+| Direct browser↔sandbox connection | Relay server lifecycle management |
+| Lower latency (no Worker in path) | Sandbox URL exposed to browser |
+| Interactive tool permissions | Requires PM2 to keep relay alive |
+
+**Reference**: [Claude Agent SDK - Streaming Mode](https://platform.claude.com/docs/en/agent-sdk/streaming-vs-single-mode)
 
 ---
 
