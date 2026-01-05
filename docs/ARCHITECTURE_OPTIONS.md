@@ -55,7 +55,18 @@ for await (const message of query({ prompt })) {
 
 ### Option 3: Hybrid Approach (Recommended)
 
-Run the Agent SDK inside the Daytona sandbox with a WebSocket relay server, enabling structured message streaming directly to the browser.
+Run the Agent SDK inside the Daytona sandbox with an HTTP streaming relay server, enabling structured message streaming directly to the browser via Server-Sent Events (SSE).
+
+#### Why HTTP Streaming over WebSockets?
+
+| Aspect | WebSocket | HTTP Streaming (SSE) |
+|--------|-----------|---------------------|
+| **Auth headers** | ❌ Not supported in browser | ✅ Standard HTTP headers |
+| **Proxy compatibility** | ⚠️ Can be blocked | ✅ Works everywhere |
+| **Firewall friendly** | ⚠️ Separate protocol | ✅ Standard HTTPS |
+| **Complexity** | Higher (connection mgmt) | Lower (stateless) |
+
+For Claude Code streaming, we need **server→client** (agent activity) with occasional **client→server** (prompts). This fits HTTP streaming perfectly: POST for prompts, SSE for responses.
 
 #### Why Hybrid?
 
@@ -69,63 +80,100 @@ The Claude Agent SDK requires filesystem access to read/write code, so it **must
 
 #### Architecture
 
-Daytona sandboxes can expose **multiple ports** (range 3000-9999) with public preview URLs. This enables serving both the app preview and WebSocket relay from the same sandbox:
+Daytona sandboxes can expose **multiple ports** (range 3000-9999) with public preview URLs. This enables serving both the app preview and HTTP streaming relay from the same sandbox:
 
 ```
-                                      Daytona Sandbox (public: true)
+                                      Daytona Sandbox
                                  ┌─────────────────────────────────────┐
                                  │                                     │
-┌─────────────┐   WebSocket      │  ┌─────────────────┐    AsyncIter   │   ┌─────────────┐
-│   Browser   │◄────────────────────│ Streaming Relay │◄──────────────────►│ Claude SDK  │
-│   (React)   │   :8080          │  │ (relay-server)  │                │   │  query()    │
-│             │                  │  └─────────────────┘                │   └─────────────┘
-│  ┌───────┐  │   HTTP (iframe)  │  ┌─────────────────┐                │
-│  │Preview│◄───────────────────────│  Vite Dev Server │                │
-│  │ iframe│  │   :3000          │  │  (user's app)   │                │
-│  └───────┘  │                  │  └─────────────────┘                │
-└─────────────┘                  │                                     │
+┌─────────────┐  POST /prompt    │  ┌─────────────────┐    AsyncIter   │   ┌─────────────┐
+│   Browser   │─────────────────────│ Streaming Relay │◄──────────────────►│ Claude SDK  │
+│   (React)   │  SSE response    │  │ (Express.js)    │                │   │  query()    │
+│             │◄────────────────────│  :8080          │                │   └─────────────┘
+│  ┌───────┐  │   HTTP (iframe)  │  └─────────────────┘                │
+│  │Preview│◄───────────────────────┌─────────────────┐                │
+│  │ iframe│  │   :3000          │  │  Vite Dev Server │                │
+│  └───────┘  │                  │  │  (user's app)   │                │
+└─────────────┘                  │  └─────────────────┘                │
                                  └─────────────────────────────────────┘
 
 Preview URLs:
   - https://3000-{sandbox-id}.{runner}.daytona.work  → Vite dev server
-  - https://8080-{sandbox-id}.{runner}.daytona.work  → WebSocket relay
+  - https://8080-{sandbox-id}.{runner}.daytona.work  → HTTP streaming relay
 ```
 
 #### Implementation
 
-**1. Streaming relay server inside sandbox:**
+**1. HTTP streaming relay server inside sandbox:**
 
 ```typescript
 // /tmp/project/relay-server.ts
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { WebSocketServer } from "ws";
+import express from "express";
+import cors from "cors";
 
-const wss = new WebSocketServer({ port: 8080 });
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-wss.on("connection", (ws) => {
-  ws.on("message", async (data) => {
-    const { prompt } = JSON.parse(data);
-
-    for await (const message of query({ prompt, options: { cwd: "/tmp/project" } })) {
-      ws.send(JSON.stringify(message));
-    }
-  });
+// Auth middleware - standard HTTP headers work!
+app.use((req, res, next) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!isValidToken(token)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
 });
+
+// POST prompt, receive SSE stream response
+app.post('/prompt', async (req, res) => {
+  const { prompt } = req.body;
+
+  // Set SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  // Stream SDK messages as SSE events
+  for await (const message of query({ prompt, options: { cwd: "/tmp/project" } })) {
+    res.write(`data: ${JSON.stringify(message)}\n\n`);
+  }
+
+  res.write('data: [DONE]\n\n');
+  res.end();
+});
+
+app.listen(8080);
 ```
 
-**2. Browser connects directly to sandbox:**
+**2. Browser streams via fetch API:**
 
 ```typescript
-// Daytona provides public preview URLs
-const ws = new WebSocket("wss://sandbox-abc123.daytona.io:8080");
+async function streamPrompt(prompt: string, onMessage: (msg: SDKMessage) => void) {
+  const response = await fetch(`${relayUrl}/prompt`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${sessionToken}`,  // Standard HTTP auth works!
+    },
+    body: JSON.stringify({ prompt }),
+  });
 
-ws.onmessage = (event) => {
-  const message = JSON.parse(event.data);
-  // message.type: 'assistant' | 'user' | 'result' | 'system'
-  renderIncrementally(message);
-};
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
 
-ws.send(JSON.stringify({ prompt: "Add a dark mode toggle" }));
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const chunk = decoder.decode(value);
+    for (const line of chunk.split('\n')) {
+      if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+        onMessage(JSON.parse(line.slice(6)));
+      }
+    }
+  }
+}
 ```
 
 **3. Cloudflare Worker initialization (`/api/initialize`):**
@@ -142,7 +190,7 @@ const relayUrl = await sandbox.getPreviewLink(8080);
 return Response.json({
   success: true,
   devServerUrl: devServerUrl.url,   // For iframe preview
-  relayUrl: relayUrl.url            // For WebSocket connection
+  relayUrl: relayUrl.url            // For HTTP streaming
 });
 ```
 
@@ -152,13 +200,17 @@ return Response.json({
 // Display live preview in iframe
 <iframe src={devServerUrl} />
 
-// Stream Claude activity via WebSocket
-const ws = new WebSocket(relayUrl.replace('https://', 'wss://'));
-ws.onmessage = (event) => renderMessage(JSON.parse(event.data));
-ws.send(JSON.stringify({ prompt: "Add dark mode" }));
+// Stream Claude activity via HTTP
+streamPrompt("Add dark mode", (message) => {
+  // message.type: 'assistant' | 'user' | 'result' | 'system'
+  renderMessage(message);
+});
 ```
 
-**Key benefit**: Browser connects directly to sandbox—no Cloudflare Worker in the streaming path.
+**Key benefits**:
+- Browser connects directly to sandbox—no Cloudflare Worker in the streaming path
+- Standard HTTP auth headers work natively (no WebSocket workarounds)
+- Better proxy/firewall compatibility
 
 #### Comparison
 
@@ -203,29 +255,29 @@ const preview = await sandbox.getPreviewLink(3000);
 
 **Access requires header**: `x-daytona-preview-token: <token>`
 
-**Limitation**: Browser WebSocket API doesn't support custom headers. Workarounds:
-- Pass token as query parameter: `wss://...?token=xxx`
-- Use WebSocket subprotocol: `new WebSocket(url, [token])`
+**Note**: With HTTP streaming (recommended), this header works natively in fetch requests.
 
 ### Option B: Application-Level Auth (Relay Server)
 
-Add token validation in the relay server:
+Add token validation middleware in the Express relay server:
 
 ```typescript
-// relay-server.ts
-wss.on("connection", (ws, req) => {
-  const url = new URL(req.url, 'http://localhost');
-  const token = url.searchParams.get('token');
+// relay-server.ts - HTTP streaming with standard auth
+app.use((req, res, next) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  // Or use Daytona token
+  const daytonaToken = req.headers['x-daytona-preview-token'];
 
-  if (!isValidToken(token)) {
-    ws.close(4001, 'Unauthorized');
-    return;
+  if (!isValidToken(token || daytonaToken)) {
+    return res.status(401).json({ error: 'Unauthorized' });
   }
-  // ... handle connection
+  next();
 });
 ```
 
-**Flow**: Worker issues session tokens → Browser passes token to relay → Relay validates
+**Flow**: Worker issues session tokens → Browser sends token in HTTP headers → Relay validates
+
+**Advantage**: HTTP streaming supports all standard auth mechanisms (Bearer tokens, cookies, custom headers) without workarounds.
 
 ### Option C: Customer Proxy (Recommended for Production)
 
@@ -274,7 +326,7 @@ Daytona's **Customer Proxy** provides enterprise-grade authentication by routing
 | [claude-code-webui](https://github.com/sugyan/claude-code-webui) | Real-time | Deno/Node backend, mobile-responsive |
 | [claude-agent-sdk-container](https://github.com/receipting/claude-agent-sdk-container) | Character-by-character | REST API, GitHub OAuth |
 
-**Most relevant for Nightona**: `claudecodeui` uses WebSocket streaming with an architecture adaptable to Cloudflare Workers + Durable Objects.
+**Most relevant for Nightona**: `claude-agent-sdk-container` uses HTTP streaming with REST API, which aligns with the recommended HTTP streaming approach.
 
 ---
 
@@ -300,8 +352,9 @@ Daytona's **Customer Proxy** provides enterprise-grade authentication by routing
 
 ## Recommended Next Steps
 
-1. Create relay server script using Claude Agent SDK with WebSocket
-2. Update Docker snapshot to include `@anthropic-ai/claude-agent-sdk` and `ws` packages
+1. Create HTTP streaming relay server using Claude Agent SDK with Express.js
+2. Update Docker snapshot to include `@anthropic-ai/claude-agent-sdk`, `express`, and `cors` packages
 3. Modify `/api/initialize` to start relay server and return both URLs
-4. Update React UI to connect WebSocket to relay URL and render streaming messages
+4. Update React UI with fetch-based streaming to render SSE messages incrementally
 5. Add PM2 ecosystem config for relay server lifecycle management
+6. Implement auth middleware in relay server (Bearer token or Daytona token validation)
